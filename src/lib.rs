@@ -16,10 +16,23 @@ struct IndexedDocument {
 }
 
 /// Contains all the indexed data, including documents and n-gram information.
+#[wasm_bindgen]
 #[derive(Serialize, Deserialize, Clone)]
 struct IndexData {
   documents: HashMap<String, IndexedDocument>,
-  ngram_vocabulary: HashSet<String>,
+  ngram_document_frequency: HashMap<String, usize>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializableDocument {
+  name: String,
+  paths: Vec<String>,
+  ngram_vector: Vec<f32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SerializableIndexData {
+  documents: HashMap<String, SerializableDocument>,
   ngram_document_frequency: HashMap<String, usize>,
 }
 
@@ -34,12 +47,10 @@ export type IndexData = {
             ngram_vector: Float32Array;
         }
     };
-    ngram_vocabulary: string[];
     ngram_document_frequency: { [key: string]: number };
 };
 
 export type MatchResult = {
-    is_match: boolean;
     similarity: number;
     name: string;
     paths: string[];
@@ -80,7 +91,6 @@ impl VectorizationSystem {
           .map_err(|e| JsValue::from_str(&format!("Failed to parse index data: {}", e)))?,
       None => IndexData {
         documents: HashMap::new(),
-        ngram_vocabulary: HashSet::new(),
         ngram_document_frequency: HashMap::new(),
       },
     };
@@ -100,13 +110,12 @@ impl VectorizationSystem {
     let query_vector = self.calculate_vector(&query_ngrams);
     let mut results = Vec::new();
 
-    for doc in self.index_data.documents.values() {
+    for (name, doc) in &self.index_data.documents {
       let similarity = cosine_similarity(&query_vector, &doc.ngram_vector);
       if similarity > self.similarity_threshold {
         results.push(MatchResult {
-          is_match: true,
           similarity,
-          name: doc.name.clone(),
+          name: name.clone(),
           paths: doc.paths.clone(),
         });
       }
@@ -152,12 +161,12 @@ impl VectorizationSystem {
   /// @param path - The new path to add.
   #[wasm_bindgen(js_name = addPath)]
   pub fn add_path(&mut self, name: &str, path: &str) -> Result<(), JsValue> {
-    if let Some(doc) = self.index_data.documents.get_mut(name) {
-      doc.paths.insert(path.to_string());
-      Ok(())
-    } else {
-      Err(JsValue::from_str(&format!("Document '{}' not found", name)))
-    }
+    self.index_data.documents.get_mut(name)
+        .map(|doc| {
+          doc.paths.insert(path.to_string());
+          Ok(())
+        })
+        .unwrap_or_else(|| Err(JsValue::from_str(&format!("Document '{}' not found", name))))
   }
 
   /// Updates the content of an existing document.
@@ -170,13 +179,13 @@ impl VectorizationSystem {
     self.update_ngram_data(&new_ngrams, old_ngrams.as_deref());
     let ngram_vector = self.calculate_vector(&new_ngrams);
 
-    if let Some(doc) = self.index_data.documents.get_mut(name) {
-      doc.content = content.to_string();
-      doc.ngram_vector = ngram_vector;
-      Ok(())
-    } else {
-      Err(JsValue::from_str(&format!("Document '{}' not found", name)))
-    }
+    self.index_data.documents.get_mut(name)
+        .map(|doc| {
+          doc.content = content.to_string();
+          doc.ngram_vector = ngram_vector;
+          Ok(())
+        })
+        .unwrap_or_else(|| Err(JsValue::from_str(&format!("Document '{}' not found", name))))
   }
 
   /// Removes a path from a document. If it's the last path, the document is removed entirely.
@@ -201,15 +210,6 @@ impl VectorizationSystem {
     Ok(())
   }
 
-  /// Serializes the current index data.
-  /// @returns The serialized IndexData object.
-  #[wasm_bindgen(js_name = serialize)]
-  pub fn serialize(&self) -> Result<IndexDataJS, JsValue> {
-    serde_wasm_bindgen::to_value(&self.index_data)
-        .map(IndexDataJS::from)
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
-  }
-
   /// Sets the similarity threshold for matching documents.
   /// @param threshold - The new similarity threshold (0.0 to 1.0).
   #[wasm_bindgen(js_name = setSimilarityThreshold)]
@@ -226,25 +226,19 @@ impl VectorizationSystem {
 
   /// Updates the n-gram data for the index.
   fn update_ngram_data(&mut self, new_ngrams: &[String], old_ngrams: Option<&[String]>) {
-    let unique_new_ngrams: HashSet<_> = new_ngrams.iter().collect();
-
-    // Remove old n-grams if updating an existing document
     if let Some(old_ngrams) = old_ngrams {
       for ngram in old_ngrams {
         if let Some(count) = self.index_data.ngram_document_frequency.get_mut(ngram) {
           *count -= 1;
           if *count == 0 {
             self.index_data.ngram_document_frequency.remove(ngram);
-            self.index_data.ngram_vocabulary.remove(ngram);
           }
         }
       }
     }
 
-    // Add new n-grams
-    for ngram in &unique_new_ngrams {
-      self.index_data.ngram_vocabulary.insert((*ngram).clone());
-      *self.index_data.ngram_document_frequency.entry((*ngram).clone()).or_insert(0) += 1;
+    for ngram in new_ngrams {
+      *self.index_data.ngram_document_frequency.entry(ngram.clone()).or_insert(0) += 1;
     }
   }
 
@@ -255,7 +249,6 @@ impl VectorizationSystem {
         *count -= 1;
         if *count == 0 {
           self.index_data.ngram_document_frequency.remove(ngram);
-          self.index_data.ngram_vocabulary.remove(ngram);
         }
       }
     }
@@ -301,6 +294,90 @@ impl VectorizationSystem {
     }
     hash
   }
+
+  /// Gets the current index data as a JSON-serializable object.
+  /// @returns A JSON-serializable representation of the current index data.
+  #[wasm_bindgen(js_name = getIndexData)]
+  pub fn get_index_data(&self) -> Result<JsValue, JsValue> {
+    #[derive(Serialize)]
+    struct SerializableIndexData {
+      documents: Vec<SerializableDocument>,
+      ngram_document_frequency: Vec<(String, usize)>,
+    }
+
+    #[derive(Serialize)]
+    struct SerializableDocument {
+      name: String,
+      paths: Vec<String>,
+      ngram_vector: Vec<f64>, // Changed to Vec<f64> for better precision
+    }
+
+    let serializable_documents: Vec<SerializableDocument> = self
+        .index_data
+        .documents
+        .values()
+        .map(|v| SerializableDocument {
+          name: v.name.clone(),
+          paths: v.paths.iter().cloned().collect(),
+          ngram_vector: v.ngram_vector.iter().map(|&f| f as f64).collect(), // Convert f32 to f64
+        })
+        .collect();
+
+    let serializable_ngram_frequency: Vec<(String, usize)> = self
+        .index_data
+        .ngram_document_frequency
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+
+    let serializable_data = SerializableIndexData {
+      documents: serializable_documents,
+      ngram_document_frequency: serializable_ngram_frequency,
+    };
+
+    serde_wasm_bindgen::to_value(&serializable_data)
+        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
+  }
+
+  #[wasm_bindgen(js_name = createFromIndexData)]
+  pub fn create_from_index_data(index_data: JsValue) -> Result<VectorizationSystem, JsValue> {
+    #[derive(Deserialize)]
+    struct SerializableIndexData {
+      documents: Vec<SerializableDocument>,
+      ngram_document_frequency: Vec<(String, usize)>,
+    }
+
+    #[derive(Deserialize)]
+    struct SerializableDocument {
+      name: String,
+      paths: Vec<String>,
+      ngram_vector: Vec<f64>,
+    }
+
+    let serializable_data: SerializableIndexData = serde_wasm_bindgen::from_value(index_data)
+        .map_err(|e| JsValue::from_str(&format!("Deserialization error: {}", e)))?;
+
+    let documents = serializable_data.documents.into_iter().map(|v| {
+      (v.name.clone(), IndexedDocument {
+        name: v.name,
+        paths: v.paths.into_iter().collect(),
+        content: String::new(),
+        ngram_vector: v.ngram_vector.into_iter()
+            .map(|f| f as f32)
+            .collect(),
+      })
+    }).collect();
+
+    let ngram_document_frequency = serializable_data.ngram_document_frequency.into_iter().collect();
+
+    Ok(VectorizationSystem {
+      index_data: IndexData {
+        documents,
+        ngram_document_frequency,
+      },
+      similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
+    })
+  }
 }
 
 /// Initializes the panic hook for better error reporting in the browser console.
@@ -313,7 +390,6 @@ pub fn init() -> Result<(), JsValue> {
 /// Represents a match result from a search query.
 #[derive(Serialize, Deserialize)]
 struct MatchResult {
-  is_match: bool,
   similarity: f32,
   name: String,
   paths: HashSet<String>,
