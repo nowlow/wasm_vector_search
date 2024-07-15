@@ -1,6 +1,7 @@
 use wasm_bindgen::prelude::*;
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, HashSet};
+use web_sys::console;
 
 const EMBEDDING_SIZE: usize = 1000;
 const DEFAULT_SIMILARITY_THRESHOLD: f32 = 0.1;
@@ -106,13 +107,36 @@ impl VectorizationSystem {
   /// @returns An array of MatchResult objects representing the search results.
   #[wasm_bindgen(js_name = search)]
   pub fn search(&self, query: &str) -> Result<MatchResultArrayJS, JsValue> {
+    console::log_1(&format!("Searching for: {}", query).into());
     let query_ngrams = self.generate_ngrams(query);
-    let query_vector = self.calculate_vector(&query_ngrams);
-    let mut results = Vec::new();
+    console::log_1(&format!("Query ngrams: {:?}", query_ngrams).into());
+    let total_docs = self.index_data.documents.len() as f32;
+    let mut query_vector = self.calculate_vector(&query_ngrams, total_docs);
 
+    // For short queries, boost the importance of exact matches
+    if query.split_whitespace().count() <= 2 {
+      for ngram in query_ngrams.iter() {
+        if ngram.len() > 1 {
+          let index = self.hash(ngram) % EMBEDDING_SIZE;
+          query_vector[index] *= 3.0;  // Increased boost factor
+        }
+      }
+      normalize_vector(&mut query_vector);
+    }
+
+    let mut results = Vec::new();
     for (name, doc) in &self.index_data.documents {
-      let similarity = cosine_similarity(&query_vector, &doc.ngram_vector);
-      if similarity > self.similarity_threshold {
+      let mut similarity = cosine_similarity(&query_vector, &doc.ngram_vector);
+
+      // Boost similarity for documents containing exact query words
+      for word in query.split_whitespace() {
+        if doc.content.to_lowercase().contains(&word.to_lowercase()) {
+          similarity *= 1.2;  // 20% boost for each matching word
+        }
+      }
+
+      console::log_1(&format!("Similarity for '{}': {}", name, similarity).into());
+      if similarity > self.similarity_threshold && !similarity.is_nan() {
         results.push(MatchResult {
           similarity,
           name: name.clone(),
@@ -121,7 +145,9 @@ impl VectorizationSystem {
       }
     }
 
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap_or(std::cmp::Ordering::Equal));
+    console::log_1(&format!("Number of results: {}", results.len()).into());
+
     serde_wasm_bindgen::to_value(&results)
         .map(MatchResultArrayJS::from)
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))
@@ -134,17 +160,17 @@ impl VectorizationSystem {
   #[wasm_bindgen(js_name = addOrUpdateDocument)]
   pub fn add_or_update_document(&mut self, name: &str, path: &str, content: &str) {
     let new_ngrams = self.generate_ngrams(content);
-    let old_ngrams = self.index_data.documents.get(name).map(|doc| self.generate_ngrams(&doc.content));
-    self.update_ngram_data(&new_ngrams, old_ngrams.as_deref());
-    let ngram_vector = self.calculate_vector(&new_ngrams);
+    let total_docs = self.index_data.documents.len() as f32 + 1.0; // Include the new document
 
-    if let Some(doc) = self.index_data.documents.get_mut(name) {
-      // Update existing document
-      doc.paths.insert(path.to_string());
-      doc.content = content.to_string();
-      doc.ngram_vector = ngram_vector;
-    } else {
-      // Add new document
+    // Update ngram_document_frequency
+    for ngram in new_ngrams.iter() {
+      let count = self.index_data.ngram_document_frequency.entry(ngram.clone()).or_insert(0);
+      *count += 1;
+    }
+
+    let ngram_vector = self.calculate_vector(&new_ngrams, total_docs);
+
+    if !ngram_vector.iter().any(|&x| x.is_nan()) && !ngram_vector.iter().all(|&x| x == 0.0) {
       let mut paths = HashSet::new();
       paths.insert(path.to_string());
       self.index_data.documents.insert(name.to_string(), IndexedDocument {
@@ -153,6 +179,8 @@ impl VectorizationSystem {
         content: content.to_string(),
         ngram_vector,
       });
+    } else {
+      console::log_1(&format!("∆ Warning: Invalid vector for document '{}'", name).into());
     }
   }
 
@@ -177,7 +205,8 @@ impl VectorizationSystem {
     let new_ngrams = self.generate_ngrams(content);
     let old_ngrams = self.index_data.documents.get(name).map(|doc| self.generate_ngrams(&doc.content));
     self.update_ngram_data(&new_ngrams, old_ngrams.as_deref());
-    let ngram_vector = self.calculate_vector(&new_ngrams);
+    let total_docs = self.index_data.documents.len() as f32;
+    let ngram_vector = self.calculate_vector(&new_ngrams, total_docs);
 
     self.index_data.documents.get_mut(name)
         .map(|doc| {
@@ -255,13 +284,12 @@ impl VectorizationSystem {
   }
 
   /// Calculates the vector representation of a set of n-grams.
-  fn calculate_vector(&self, ngrams: &[String]) -> Vec<f32> {
+  fn calculate_vector(&self, ngrams: &[String], total_docs: f32) -> Vec<f32> {
     let mut vector = vec![0.0; EMBEDDING_SIZE];
-    let total_docs = self.index_data.documents.len() as f32;
 
     for ngram in ngrams {
       if let Some(&doc_freq) = self.index_data.ngram_document_frequency.get(ngram) {
-        let idf = (total_docs / (doc_freq as f32)).ln() + 1.0;
+        let idf = ((total_docs + 1.0) / (doc_freq as f32 + 1.0)).ln() + 1.0; // Smoothed IDF
         let index = self.hash(ngram) % EMBEDDING_SIZE;
         vector[index] += idf;
       }
@@ -274,15 +302,21 @@ impl VectorizationSystem {
   /// Generates n-grams from the input text.
   fn generate_ngrams(&self, text: &str) -> Vec<String> {
     let text = text.to_lowercase();
-    let chars: Vec<char> = text.chars().collect();
+    let words: Vec<&str> = text.split_whitespace().collect();
     let mut ngrams = Vec::new();
 
+    // Add individual words
+    ngrams.extend(words.iter().map(|&w| w.to_string()));
+
+    // Generate character n-grams
+    let chars: Vec<char> = text.chars().collect();
     for &size in &NGRAM_SIZES {
       for window in chars.windows(size) {
         ngrams.push(window.iter().collect::<String>());
       }
     }
 
+    console::log_1(&format!("∆ First 10 ngrams: {:?}", &ngrams[..10.min(ngrams.len())]).into());
     ngrams
   }
 
@@ -309,7 +343,7 @@ impl VectorizationSystem {
     struct SerializableDocument {
       name: String,
       paths: Vec<String>,
-      ngram_vector: Vec<f64>, // Changed to Vec<f64> for better precision
+      ngram_vector: Vec<String>, // We'll use strings to represent all float values
     }
 
     let serializable_documents: Vec<SerializableDocument> = self
@@ -319,7 +353,13 @@ impl VectorizationSystem {
         .map(|v| SerializableDocument {
           name: v.name.clone(),
           paths: v.paths.iter().cloned().collect(),
-          ngram_vector: v.ngram_vector.iter().map(|&f| f as f64).collect(), // Convert f32 to f64
+          ngram_vector: v.ngram_vector.iter().map(|&f| {
+            if f.is_nan() {
+              "NaN".to_string()
+            } else {
+              f.to_string()
+            }
+          }).collect(),
         })
         .collect();
 
@@ -351,7 +391,7 @@ impl VectorizationSystem {
     struct SerializableDocument {
       name: String,
       paths: Vec<String>,
-      ngram_vector: Vec<f64>,
+      ngram_vector: Vec<String>,
     }
 
     let serializable_data: SerializableIndexData = serde_wasm_bindgen::from_value(index_data)
@@ -361,9 +401,15 @@ impl VectorizationSystem {
       (v.name.clone(), IndexedDocument {
         name: v.name,
         paths: v.paths.into_iter().collect(),
-        content: String::new(),
+        content: String::new(), // Empty string as we're not storing content
         ngram_vector: v.ngram_vector.into_iter()
-            .map(|f| f as f32)
+            .map(|s| {
+              if s == "NaN" {
+                f32::NAN
+              } else {
+                s.parse::<f32>().unwrap_or(0.0)
+              }
+            })
             .collect(),
       })
     }).collect();
@@ -406,7 +452,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Normalizes a vector to unit length.
 fn normalize_vector(vector: &mut Vec<f32>) {
   let magnitude: f32 = vector.iter().map(|&x| x * x).sum::<f32>().sqrt();
-  if magnitude > 0.0 {
+  if magnitude > 1e-10 {  // Only normalize if magnitude is not too close to zero
     for i in 0..vector.len() {
       vector[i] /= magnitude;
     }
