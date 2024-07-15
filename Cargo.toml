@@ -9,6 +9,8 @@ serde-wasm-bindgen = "0.6.5"
 wasm-bindgen = "0.2.92"
 console_error_panic_hook = "0.1.7"
 web-sys = { version = "0.3.69", features = ["console"] }
+ngrammatic = "0.4.0"
+flate2 = "1.0.30"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
